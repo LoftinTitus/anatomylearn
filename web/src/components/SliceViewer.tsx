@@ -1,0 +1,132 @@
+import { Niivue, SHOW_RENDER, SLICE_TYPE } from '@niivue/niivue'
+import { useEffect, useRef, useState } from 'react'
+import type { Manifest, Vec3 } from '../types'
+
+// [window min, window max] in Hounsfield units.
+const WINDOWS = {
+  'Soft tissue': [-160, 240],
+  Lung: [-1350, 150],
+  Bone: [-450, 1050],
+} as const
+type WindowName = keyof typeof WINDOWS
+
+interface Props {
+  manifest: Manifest
+  selectedId: string | null
+  crosshairRas: Vec3 | null
+  onPick: (label: number, ras: Vec3) => void
+}
+
+export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const nvRef = useRef<Niivue | null>(null)
+  const [ready, setReady] = useState(false)
+  const [windowName, setWindowName] = useState<WindowName>('Soft tissue')
+  const [showLabels, setShowLabels] = useState(true)
+  const onPickRef = useRef(onPick)
+  useEffect(() => {
+    onPickRef.current = onPick
+  }, [onPick])
+
+  useEffect(() => {
+    const nv = new Niivue({
+      backColor: [0, 0, 0, 1],
+      crosshairColor: [0.22, 0.74, 0.97, 1],
+      crosshairGap: 6,
+      isRadiologicalConvention: true, // patient's right on screen left, as in clinical viewing
+      multiplanarShowRender: SHOW_RENDER.NEVER,
+      isOrientCube: false,
+      loadingText: 'Loading CT...',
+    })
+    nvRef.current = nv
+    let cancelled = false
+    nv.attachToCanvas(canvasRef.current!)
+      .then(() =>
+        nv.loadVolumes([
+          { url: '/data/ct.nii.gz', colormap: 'gray', cal_min: WINDOWS['Soft tissue'][0], cal_max: WINDOWS['Soft tissue'][1] },
+          { url: '/data/seg.nii.gz', opacity: 0.45 },
+        ]),
+      )
+      .then(() => {
+        if (cancelled) return
+        nv.setSliceType(SLICE_TYPE.MULTIPLANAR)
+        nv.onLocationChange = (loc) => {
+          const { mm, values } = loc as { mm: number[]; values: { value: number }[] }
+          onPickRef.current(Math.round(values[1]?.value ?? 0), [mm[0], mm[1], mm[2]])
+        }
+        setReady(true)
+      })
+    return () => {
+      cancelled = true
+      nv.cleanup()
+      nvRef.current = null
+    }
+  }, [])
+
+  // Label colours: all structures, or only the selected one. NiiVue renders label
+  // alpha as on/off, so unselected labels are hidden rather than dimmed.
+  useEffect(() => {
+    const nv = nvRef.current
+    if (!ready || !nv) return
+    const seg = nv.volumes[1]
+    // The transparent -1 entry keeps background (0) off the LUT's edge texel: NiiVue's
+    // shader nudges the lowest value upward, which otherwise blends in label 1's colour.
+    const rows = [
+      { label: -1, color: [0, 0, 0], alpha: 0, name: '' },
+      { label: 0, color: [0, 0, 0], alpha: 0, name: '' },
+    ].concat(
+      manifest.structures.map((s) => ({
+        label: s.label,
+        color: s.color,
+        alpha: selectedId === null || s.id === selectedId ? 255 : 0,
+        name: s.name,
+      })),
+    )
+    seg.setColormapLabel({
+      R: rows.map((r) => r.color[0]),
+      G: rows.map((r) => r.color[1]),
+      B: rows.map((r) => r.color[2]),
+      A: rows.map((r) => r.alpha),
+      I: rows.map((r) => r.label),
+      labels: rows.map((r) => r.name),
+    })
+    nv.setOpacity(1, showLabels ? 0.55 : 0)
+    nv.updateGLVolume()
+  }, [ready, manifest, selectedId, showLabels])
+
+  useEffect(() => {
+    const nv = nvRef.current
+    if (!ready || !nv) return
+    const [min, max] = WINDOWS[windowName]
+    nv.volumes[0].cal_min = min
+    nv.volumes[0].cal_max = max
+    nv.updateGLVolume()
+  }, [ready, windowName])
+
+  // Follow selections made in the 3D view or sidebar (setting crosshairPos does not re-fire onLocationChange).
+  useEffect(() => {
+    const nv = nvRef.current
+    if (!ready || !nv || !crosshairRas) return
+    nv.scene.crosshairPos = nv.mm2frac(crosshairRas, 0, true)
+    nv.drawScene()
+  }, [ready, crosshairRas])
+
+  return (
+    <div className="slice-viewer">
+      <div className="toolbar">
+        {(Object.keys(WINDOWS) as WindowName[]).map((name) => (
+          <button key={name} className={name === windowName ? 'active' : ''} onClick={() => setWindowName(name)}>
+            {name}
+          </button>
+        ))}
+        <label className="toggle">
+          <input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
+          Labels
+        </label>
+      </div>
+      <div className="canvas-wrap">
+        <canvas ref={canvasRef} />
+      </div>
+    </div>
+  )
+}

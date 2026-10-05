@@ -1,0 +1,7 @@
+TotalSegmentator>=2.18,<3
+nibabel>=5.4
+numpy>=2.0
+scikit-image>=0.26
+scipy>=1.18
+trimesh>=5.1
+fast-simplification>=0.2

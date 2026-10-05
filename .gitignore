@@ -1,0 +1,4 @@
+.DS_Store
+pipeline/.venv/
+pipeline/data/
+__pycache__/
