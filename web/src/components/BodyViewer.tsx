@@ -61,6 +61,21 @@ function Model({ manifest, visible, selectedId, xray, onPick }: Props) {
       {parts.map(({ structure, geometry }) => {
         if (!visible.has(structure.id)) return null
         const isSelected = structure.id === selectedId
+        if (structure.shell) {
+          // No pointer handlers: R3F only raycasts interactive meshes, so clicks reach the organs inside.
+          return (
+            <mesh key={structure.id} geometry={geometry} renderOrder={2}>
+              <meshStandardMaterial
+                color={isSelected ? '#ffd166' : '#d9c2b0'}
+                roughness={0.8}
+                transparent
+                opacity={isSelected ? 0.35 : 0.1}
+                depthWrite={false}
+                side={THREE.FrontSide}
+              />
+            </mesh>
+          )
+        }
         const faded = xray && selectedId !== null && !isSelected
         return (
           <mesh

@@ -100,7 +100,7 @@ export default function App() {
       </main>
       <div className="right">
         <SliceViewer manifest={manifest} selectedId={selectedId} crosshairRas={crosshairRas} onPick={pickFromSlices} />
-        <InfoPanel structure={selected} />
+        <InfoPanel structure={selected} manifest={manifest} />
       </div>
     </div>
   )

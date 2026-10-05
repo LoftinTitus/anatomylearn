@@ -7,6 +7,8 @@ export interface Structure {
   name: string
   system: string
   pathology: boolean
+  /** Body outline: drawn as a translucent envelope that doesn't block clicks */
+  shell: boolean
   color: Vec3
   snomed: { code: string; meaning: string; laterality: string | null } | null
   /** A point guaranteed to lie inside the structure, RAS mm */
@@ -19,8 +21,11 @@ export interface Structure {
 
 export interface Manifest {
   source: string
+  sourceUrl: string | null
   segmentation: string
   rasToThree: [Vec3, Vec3, Vec3]
   volumeBoundsRas: [Vec3, Vec3]
+  /** Superior-inferior stretches with no CT data (RAS z range in mm) */
+  noData: { zRange: [number, number]; note: string }[]
   structures: Structure[]
 }

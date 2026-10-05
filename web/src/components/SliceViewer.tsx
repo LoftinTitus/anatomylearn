@@ -10,6 +10,14 @@ const WINDOWS = {
 } as const
 type WindowName = keyof typeof WINDOWS
 
+const VIEWS = {
+  Axial: SLICE_TYPE.AXIAL,
+  Coronal: SLICE_TYPE.CORONAL,
+  Sagittal: SLICE_TYPE.SAGITTAL,
+  All: SLICE_TYPE.MULTIPLANAR,
+} as const
+type ViewName = keyof typeof VIEWS
+
 interface Props {
   manifest: Manifest
   selectedId: string | null
@@ -23,6 +31,7 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
   const [ready, setReady] = useState(false)
   const [windowName, setWindowName] = useState<WindowName>('Soft tissue')
   const [showLabels, setShowLabels] = useState(true)
+  const [view, setView] = useState<ViewName>('Axial')
   const onPickRef = useRef(onPick)
   useEffect(() => {
     onPickRef.current = onPick
@@ -49,7 +58,6 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
       )
       .then(() => {
         if (cancelled) return
-        nv.setSliceType(SLICE_TYPE.MULTIPLANAR)
         nv.onLocationChange = (loc) => {
           const { mm, values } = loc as { mm: number[]; values: { value: number }[] }
           onPickRef.current(Math.round(values[1]?.value ?? 0), [mm[0], mm[1], mm[2]])
@@ -78,7 +86,8 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
       manifest.structures.map((s) => ({
         label: s.label,
         color: s.color,
-        alpha: selectedId === null || s.id === selectedId ? 255 : 0,
+        // Body outline labels would wash over the whole body, so show them only when selected.
+        alpha: s.id === selectedId || (selectedId === null && !s.shell) ? 255 : 0,
         name: s.name,
       })),
     )
@@ -93,6 +102,10 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
     nv.setOpacity(1, showLabels ? 0.55 : 0)
     nv.updateGLVolume()
   }, [ready, manifest, selectedId, showLabels])
+
+  useEffect(() => {
+    if (ready) nvRef.current?.setSliceType(VIEWS[view])
+  }, [ready, view])
 
   useEffect(() => {
     const nv = nvRef.current
@@ -114,6 +127,13 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
   return (
     <div className="slice-viewer">
       <div className="toolbar">
+        <div className="segmented" role="group" aria-label="Slice view">
+          {(Object.keys(VIEWS) as ViewName[]).map((name) => (
+            <button key={name} className={name === view ? 'active' : ''} onClick={() => setView(name)}>
+              {name}
+            </button>
+          ))}
+        </div>
         {(Object.keys(WINDOWS) as WindowName[]).map((name) => (
           <button key={name} className={name === windowName ? 'active' : ''} onClick={() => setWindowName(name)}>
             {name}
