@@ -1,4 +1,4 @@
-import { Niivue, SHOW_RENDER, SLICE_TYPE } from '@niivue/niivue'
+import { Niivue, NVImage, SHOW_RENDER, SLICE_TYPE } from '@niivue/niivue'
 import { useEffect, useRef, useState } from 'react'
 import type { Manifest, Vec3 } from '../types'
 
@@ -29,6 +29,8 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const nvRef = useRef<Niivue | null>(null)
   const [ready, setReady] = useState(false)
+  // A low-res CT shows first; the full-resolution one replaces it when downloaded.
+  const [fullCt, setFullCt] = useState(false)
   const [windowName, setWindowName] = useState<WindowName>('Soft tissue')
   const [showLabels, setShowLabels] = useState(true)
   const [view, setView] = useState<ViewName>('Axial')
@@ -46,13 +48,19 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
       multiplanarShowRender: SHOW_RENDER.NEVER,
       isOrientCube: false,
       loadingText: 'Loading CT...',
-    })
+      // Patched option (patches/@niivue+niivue+*.patch): skip the 3D-render gradient pass,
+      // which otherwise runs on every refresh and dominates selection latency.
+      skipGradients: true,
+    } as ConstructorParameters<typeof Niivue>[0])
     nvRef.current = nv
     let cancelled = false
+    const ctOptions = { colormap: 'gray', cal_min: WINDOWS['Soft tissue'][0], cal_max: WINDOWS['Soft tissue'][1] }
+    // Start the big download right away, in parallel with the preview.
+    const full = NVImage.loadFromUrl({ url: '/data/ct.nii.gz', ...ctOptions })
     nv.attachToCanvas(canvasRef.current!)
       .then(() =>
         nv.loadVolumes([
-          { url: '/data/ct.nii.gz', colormap: 'gray', cal_min: WINDOWS['Soft tissue'][0], cal_max: WINDOWS['Soft tissue'][1] },
+          { url: '/data/ct_preview.nii.gz', ...ctOptions },
           { url: '/data/seg.nii.gz', opacity: 0.45 },
         ]),
       )
@@ -63,7 +71,17 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
           onPickRef.current(Math.round(values[1]?.value ?? 0), [mm[0], mm[1], mm[2]])
         }
         setReady(true)
+        return full
       })
+      .then((image) => {
+        if (cancelled || !image) return
+        const preview = nv.volumes[0]
+        nv.addVolume(image)
+        nv.setVolume(image, 0) // becomes the background; the label map stays on top
+        nv.removeVolume(preview)
+        setFullCt(true)
+      })
+      .catch((err) => console.warn('CT failed to load', err))
     return () => {
       cancelled = true
       nv.cleanup()
@@ -99,9 +117,13 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
       I: rows.map((r) => r.label),
       labels: rows.map((r) => r.name),
     })
-    nv.setOpacity(1, showLabels ? 0.55 : 0)
     nv.updateGLVolume()
-  }, [ready, manifest, selectedId, showLabels])
+  }, [ready, manifest, selectedId])
+
+  // setOpacity refreshes the GPU textures itself, so keep it out of the selection path.
+  useEffect(() => {
+    if (ready) nvRef.current?.setOpacity(1, showLabels ? 0.55 : 0)
+  }, [ready, showLabels])
 
   useEffect(() => {
     if (ready) nvRef.current?.setSliceType(VIEWS[view])
@@ -114,7 +136,7 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
     nv.volumes[0].cal_min = min
     nv.volumes[0].cal_max = max
     nv.updateGLVolume()
-  }, [ready, windowName])
+  }, [ready, fullCt, windowName])
 
   // Follow selections made in the 3D view or sidebar (setting crosshairPos does not re-fire onLocationChange).
   useEffect(() => {
@@ -122,7 +144,7 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
     if (!ready || !nv || !crosshairRas) return
     nv.scene.crosshairPos = nv.mm2frac(crosshairRas, 0, true)
     nv.drawScene()
-  }, [ready, crosshairRas])
+  }, [ready, fullCt, crosshairRas])
 
   return (
     <div className="slice-viewer">
@@ -139,6 +161,7 @@ export function SliceViewer({ manifest, selectedId, crosshairRas, onPick }: Prop
             {name}
           </button>
         ))}
+        {ready && !fullCt && <span className="loading-badge">Loading full detail…</span>}
         <label className="toggle">
           <input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
           Labels

@@ -41,11 +41,14 @@ npm run dev
 
 ### Pipeline options
 
-- `--full`: the 1.5 mm TotalSegmentator model. More accurate, but slow without a GPU (the default is the 3 mm fast model).
+- `--full`: the 1.5 mm TotalSegmentator model. More accurate, but slower (the default is the 3 mm fast model). Large scans are segmented in overlapping 19 cm slabs so memory stays at a few GB; running the full model on a whole-body volume in one pass needs far more than 16 GB.
 - `--device mps|gpu`: run segmentation on Apple Silicon or an NVIDIA GPU.
 - `--seg path.nii.gz`: reuse an existing multilabel segmentation.
 - `--web-spacing 2`: resample large scans before shipping them to the browser.
-- `--faces 8000`: triangle budget per structure.
+- `--mm2-per-face 4` / `--max-faces 60000`: mesh density. Triangles scale with each structure's surface area.
+- `--preview-spacing 4`: resolution of the small CT the app shows while the full one downloads.
+
+Web output (`web/public/data/`): `body.glb` (meshopt-compressed with glTF-Transform from `web/node_modules`), `ct_preview.nii.gz` + `ct.nii.gz` (masked to the body and cropped), `seg.nii.gz` and `structures.json`.
 
 - `--tasks total,body`: the TotalSegmentator tasks to run. `body` adds a translucent whole-body outline.
 
@@ -65,6 +68,10 @@ curl -L -o data/raw/example_ct.nii.gz \
 - **Arms cut off:** the arms lie partly outside the scanner's field of view, so they're cut off at the sides.
 - **Cadaver artifacts:** expect postmortem gas in vessels and some streak artifact.
 - **Bones not covered:** TotalSegmentator's free `total` task covers the skull down to the femurs and humeri. Forearm, hand, lower-leg and foot bones need the `appendicular_bones` task, which requires a license from the TotalSegmentator authors (free for non-commercial use).
+
+## Patched dependency
+
+`web/patches/` holds a small [patch-package](https://github.com/ds300/patch-package) patch for NiiVue (reapplied on `npm install`). It adds a `skipGradients` option that skips a 3D-rendering pass NiiVue otherwise runs on every update; this app only shows 2D slices, and the pass made each selection take ~850 ms instead of ~325 ms. Re-check the patch when upgrading NiiVue.
 
 ## Coordinates
 

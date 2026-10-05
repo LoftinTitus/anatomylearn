@@ -38,18 +38,17 @@ function Model({ manifest, visible, selectedId, xray, onPick }: Props) {
   const { scene } = useGLTF('/data/body.glb')
   const [hover, setHover] = useState<{ id: string; point: THREE.Vector3 } | null>(null)
 
-  // Bake each node's transform so every geometry is in shared world space.
+  // Keep each node's world transform rather than baking it in: the compressed model
+  // stores quantized integer positions that the node transform scales back to millimetres.
   const parts = useMemo(() => {
     const byId = new Map(manifest.structures.map((s) => [s.id, s]))
-    const out: { structure: Structure; geometry: THREE.BufferGeometry }[] = []
+    const out: { structure: Structure; geometry: THREE.BufferGeometry; matrix: THREE.Matrix4 }[] = []
     scene.updateMatrixWorld(true)
     scene.traverse((obj) => {
       if (!(obj instanceof THREE.Mesh)) return
       const structure = byId.get(obj.name) ?? byId.get(obj.parent?.name ?? '')
       if (!structure) return
-      const geometry = (obj.geometry as THREE.BufferGeometry).clone().applyMatrix4(obj.matrixWorld)
-      geometry.computeVertexNormals()
-      out.push({ structure, geometry })
+      out.push({ structure, geometry: obj.geometry, matrix: obj.matrixWorld.clone() })
     })
     return out
   }, [scene, manifest])
@@ -58,13 +57,13 @@ function Model({ manifest, visible, selectedId, xray, onPick }: Props) {
 
   return (
     <group>
-      {parts.map(({ structure, geometry }) => {
+      {parts.map(({ structure, geometry, matrix }) => {
         if (!visible.has(structure.id)) return null
         const isSelected = structure.id === selectedId
         if (structure.shell) {
           // No pointer handlers: R3F only raycasts interactive meshes, so clicks reach the organs inside.
           return (
-            <mesh key={structure.id} geometry={geometry} renderOrder={2}>
+            <mesh key={structure.id} geometry={geometry} matrix={matrix} matrixAutoUpdate={false} renderOrder={2}>
               <meshStandardMaterial
                 color={isSelected ? '#ffd166' : '#d9c2b0'}
                 roughness={0.8}
@@ -81,6 +80,8 @@ function Model({ manifest, visible, selectedId, xray, onPick }: Props) {
           <mesh
             key={structure.id}
             geometry={geometry}
+            matrix={matrix}
+            matrixAutoUpdate={false}
             renderOrder={faded ? 1 : 0}
             onPointerMove={(e: ThreeEvent<PointerEvent>) => {
               e.stopPropagation()

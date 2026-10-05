@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -25,7 +27,11 @@ from scipy import ndimage
 from skimage import measure
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_OUT = ROOT.parent / "web" / "public" / "data"
+WEB = ROOT.parent / "web"
+DEFAULT_OUT = WEB / "public" / "data"
+
+# nibabel defaults to the fastest, weakest gzip; web assets are written once and downloaded often.
+nib.openers.Opener.default_compresslevel = 9
 
 # RAS (x=right, y=anterior, z=superior) -> three.js (x, y=up, z=toward viewer).
 # three.x = patient's left, three.y = superior, three.z = anterior, so a camera
@@ -59,9 +65,10 @@ SYSTEM_RULES: list[tuple[str, tuple[str, ...]]] = [
 # "shell" structures (the body outline) render as a translucent, non-clickable
 # envelope. All tasks listed here are free to use; licensed ones (e.g.
 # appendicular_bones) can be added once a license is configured.
+# mm2_per_face sets mesh density: smaller = more triangles per unit of surface.
 TASKS = {
-    "total": {"offset": 0, "shell": False, "faces": 0},
-    "body": {"offset": 200, "shell": True, "faces": 40000},
+    "total": {"offset": 0, "shell": False, "mm2_per_face": None},
+    "body": {"offset": 200, "shell": True, "mm2_per_face": 60.0},
 }
 
 PATHOLOGY = {"kidney_cyst_left", "kidney_cyst_right"}
@@ -118,12 +125,48 @@ def display_name(slug: str, snomed: dict | None) -> str:
     return meaning
 
 
-def segment(ct_path: Path, seg_path: Path, task: str, fast: bool, device: str) -> None:
+def segment(ct_path: Path, seg_path: Path, task: str, fast: bool, device: str,
+            slab_mm: float = 192, overlap_mm: float = 48) -> None:
+    """Run TotalSegmentator, in overlapping slabs along the body axis for large scans.
+
+    The full-resolution model holds a probability map per class in memory; on a
+    whole-body scan that is far more than a 16 GB machine has. Each slab keeps
+    only its central part, so the overlap gives the model context at the seams.
+    Slabs that are all air (e.g. the stretch with no CT) are skipped."""
+    import gc
+
     from totalsegmentator.python_api import totalsegmentator
 
     print(f"Segmenting {ct_path.name}: task={task} fast={fast} device={device} ...")
     t = time.time()
-    totalsegmentator(ct_path, seg_path, ml=True, task=task, fast=fast, device=device, quiet=True)
+    opts = dict(ml=True, task=task, fast=fast, device=device, quiet=True, nr_thr_resamp=1, nr_thr_saving=1)
+    img = nib.as_closest_canonical(nib.load(ct_path))
+    data = np.asanyarray(img.dataobj)
+    dz = float(img.header.get_zooms()[2])
+    nz = data.shape[2]
+    slab, overlap = int(slab_mm / dz), int(overlap_mm / dz)
+    if fast or nz <= slab + 2 * overlap:
+        totalsegmentator(img, seg_path, **opts)
+        print(f"  done in {time.time() - t:.0f}s")
+        return
+
+    out = np.zeros(data.shape, dtype=np.uint8)
+    for k0 in range(0, nz, slab):
+        k1 = min(k0 + slab, nz)
+        e0, e1 = max(k0 - overlap, 0), min(k1 + overlap, nz)
+        sub = data[:, :, e0:e1]
+        if (sub > -500).mean() < 0.002:
+            print(f"  slab {k0}-{k1}: no tissue, skipped")
+            continue
+        sub_affine = img.affine.copy()
+        sub_affine[:3, 3] = nib.affines.apply_affine(img.affine, [0, 0, e0])
+        ts = time.time()
+        result = totalsegmentator(nib.Nifti1Image(np.ascontiguousarray(sub), sub_affine), None, **opts)
+        out[:, :, k0:k1] = np.asanyarray(result.dataobj)[:, :, k0 - e0:k1 - e0]
+        print(f"  slab {k0}-{k1} of {nz}: {time.time() - ts:.0f}s")
+        del result
+        gc.collect()
+    nib.save(nib.Nifti1Image(out, img.affine), seg_path)
     print(f"  done in {time.time() - t:.0f}s")
 
 
@@ -171,23 +214,41 @@ def drop_fragments(mask: np.ndarray, voxel_mm: float, min_fraction: float = 0.1,
     return np.isin(labeled, keep)
 
 
-def mask_to_mesh(mask: np.ndarray, affine: np.ndarray, target_faces: int) -> trimesh.Trimesh | None:
-    # Light blur before marching cubes removes the voxel staircase.
-    field = ndimage.gaussian_filter(np.pad(mask, 2).astype(np.float32), sigma=0.8)
+def mask_to_mesh(mask: np.ndarray, affine: np.ndarray, mm2_per_face: float, max_faces: int,
+                 smooth_mm: float = 1.2) -> trimesh.Trimesh | None:
+    """Binary mask -> smooth surface in three.js coordinates.
+
+    The triangle budget scales with surface area, so a rib and the liver get
+    the same detail per square millimetre instead of the same triangle count."""
+    voxel_mm = float(np.mean(np.sqrt((affine[:3, :3] ** 2).sum(axis=0))))
+    # Blur before marching cubes removes the voxel staircase.
+    field = ndimage.gaussian_filter(np.pad(mask, 2).astype(np.float32), sigma=smooth_mm / voxel_mm)
     if field.max() < 0.5:
         return None
     verts, faces, _, _ = measure.marching_cubes(field, level=0.5)
-    verts -= 2  # undo padding
-    if len(faces) > target_faces:
-        verts, faces = fast_simplification.simplify(
-            verts.astype(np.float32), faces, target_reduction=1 - target_faces / len(faces))
-    ras = nib.affines.apply_affine(affine, verts)
+    ras = nib.affines.apply_affine(affine, verts - 2)  # undo padding
+    area = trimesh.Trimesh(ras, faces, process=False).area
+    target = int(np.clip(area / mm2_per_face, 200, max_faces))
+    if len(faces) > target:
+        ras, faces = fast_simplification.simplify(
+            ras.astype(np.float32), faces, target_reduction=1 - target / len(faces))
     mesh = trimesh.Trimesh(ras @ RAS_TO_THREE.T, faces, process=True)
     # Keep normals pointing outward regardless of affine handedness.
     if mesh.volume < 0:
         mesh.invert()
     trimesh.smoothing.filter_taubin(mesh, iterations=10)
     return mesh
+
+
+def compress_glb(src: Path, dest: Path) -> None:
+    """Quantize + meshopt-compress with glTF-Transform (installed in web/)."""
+    cli = WEB / "node_modules" / ".bin" / "gltf-transform"
+    if not cli.exists():
+        print("  glTF-Transform not found (run `npm install` in web/); writing uncompressed GLB")
+        shutil.copy(src, dest)
+        return
+    subprocess.run([str(cli), "meshopt", str(src), str(dest)], check=True, capture_output=True)
+    print(f"  compressed model {src.stat().st_size / 1e6:.1f}MB -> {dest.stat().st_size / 1e6:.1f}MB")
 
 
 def main() -> None:
@@ -202,7 +263,11 @@ def main() -> None:
     ap.add_argument("--web-spacing", type=float, default=0.0,
                     help="Resample the web CT/label volumes to this isotropic spacing in mm (0 = keep). "
                          "Meshes are always built at full resolution.")
-    ap.add_argument("--faces", type=int, default=8000, help="Target triangles per structure")
+    ap.add_argument("--mm2-per-face", type=float, default=4.0,
+                    help="Mesh density: surface area per triangle in mm^2 (smaller = finer)")
+    ap.add_argument("--max-faces", type=int, default=60000, help="Triangle cap per structure")
+    ap.add_argument("--preview-spacing", type=float, default=4.0,
+                    help="Spacing of the low-res CT the web app shows while the full one downloads")
     args = ap.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -233,7 +298,8 @@ def main() -> None:
     merged = np.zeros(ct.shape, dtype=np.uint8)
 
     for task in tasks:
-        seg_path = args.seg if (task == "total" and args.seg) else work / f"{stem}_{task}.nii.gz"
+        suffix = "_hires" if args.full else ""
+        seg_path = args.seg if (task == "total" and args.seg) else work / f"{stem}_{task}{suffix}.nii.gz"
         if not seg_path.exists():
             segment(args.ct, seg_path, task=task, fast=not args.full, device=args.device)
         else:
@@ -242,7 +308,8 @@ def main() -> None:
         if seg.shape != ct.shape or not np.allclose(seg.affine, affine, atol=1e-3):
             raise SystemExit(f"{seg_path.name} {seg.shape} is not on the CT grid {ct.shape}")
         seg_data = np.asanyarray(seg.dataobj).astype(np.uint8)
-        offset, shell, faces = TASKS[task]["offset"], TASKS[task]["shell"], TASKS[task]["faces"] or args.faces
+        offset, shell = TASKS[task]["offset"], TASKS[task]["shell"]
+        mm2_per_face = TASKS[task]["mm2_per_face"] or args.mm2_per_face
         labels = class_map[task]
 
         for label, slices in enumerate(ndimage.find_objects(seg_data), start=1):
@@ -269,7 +336,7 @@ def main() -> None:
             crop_affine = affine.copy()
             crop_affine[:3, 3] = nib.affines.apply_affine(affine, lo)
 
-            mesh = mask_to_mesh(crop, crop_affine, faces)
+            mesh = mask_to_mesh(crop, crop_affine, mm2_per_face, args.max_faces)
             if mesh is None or len(mesh.faces) == 0:
                 continue
             sn = snomed.get(slug)
@@ -302,17 +369,33 @@ def main() -> None:
             })
             print(f"  {label + offset:3d} {slug:32s} {len(mesh.faces):6d} faces")
 
-    scene.export(args.out / "body.glb")
+    raw_glb = work / f"{stem}_body_raw.glb"
+    scene.export(raw_glb)
+    compress_glb(raw_glb, args.out / "body.glb")
 
-    seg_img = nib.Nifti1Image(merged, affine)
+    # Web volumes: blank everything outside the body (air noise and the scanner table
+    # compress poorly) and crop to the body's bounding box.
+    ct_data = np.asanyarray(ct.dataobj).astype(np.int16)
+    body = merged > 0
+    if "body" in tasks:
+        body = ndimage.binary_dilation(body, iterations=3)
+        ct_data = np.where(body, ct_data, -1024).astype(np.int16)
+    (box,) = ndimage.find_objects(body.astype(np.uint8)) or [tuple(slice(0, n) for n in body.shape)]
+    box = tuple(slice(max(b.start - 5, 0), min(b.stop + 5, n)) for b, n in zip(box, body.shape))
+    crop_affine = affine.copy()
+    crop_affine[:3, 3] = nib.affines.apply_affine(affine, [b.start for b in box])
+    ct_img = nib.Nifti1Image(np.clip(ct_data[box], -1024, 3071).astype(np.int16), crop_affine)
+    seg_img = nib.Nifti1Image(merged[box], crop_affine)
+
+    preview = resample(ct_img, args.preview_spacing, order=1)
+    nib.save(nib.Nifti1Image(np.asanyarray(preview.dataobj).astype(np.int16), preview.affine), args.out / "ct_preview.nii.gz")
     if args.web_spacing:
-        ct = resample(ct, args.web_spacing, order=1)
+        ct_img = resample(ct_img, args.web_spacing, order=1)
         seg_img = resample(seg_img, args.web_spacing, order=0)
-    ct_data = np.clip(np.asanyarray(ct.dataobj), -1024, 3071).astype(np.int16)
-    nib.save(nib.Nifti1Image(ct_data, ct.affine), args.out / "ct.nii.gz")
+    nib.save(nib.Nifti1Image(np.asanyarray(ct_img.dataobj).astype(np.int16), ct_img.affine), args.out / "ct.nii.gz")
     nib.save(nib.Nifti1Image(np.asanyarray(seg_img.dataobj).astype(np.uint8), seg_img.affine), args.out / "seg.nii.gz")
 
-    corners = nib.affines.apply_affine(affine, np.array([[0, 0, 0], np.array(merged.shape) - 1]))
+    corners = nib.affines.apply_affine(crop_affine, np.array([[0, 0, 0], [b.stop - b.start - 1 for b in box]]))
     manifest = {
         "source": sidecar.get("source", args.ct.name),
         "sourceUrl": sidecar.get("sourceUrl"),

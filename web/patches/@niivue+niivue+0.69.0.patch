@@ -1,0 +1,14 @@
+diff --git a/node_modules/@niivue/niivue/build/niivue/index.js b/node_modules/@niivue/niivue/build/niivue/index.js
+index e9f867a..2d949ac 100644
+--- a/node_modules/@niivue/niivue/build/niivue/index.js
++++ b/node_modules/@niivue/niivue/build/niivue/index.js
+@@ -40853,6 +40853,9 @@ var Niivue = class extends EventTarget {
+     this.gl.deleteFramebuffer(fb);
+     if (layer === 0) {
+       this.volumeTexture = outTexture;
++    }
++    // anatomylearn patch: gradients only feed 3D volume rendering; skip them for slice-only viewers.
++    if (layer === 0 && !this.opts.skipGradients) {
+       this.gradientTexture = gradientGL({
+         gl: this.gl,
+         hdr,
