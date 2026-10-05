@@ -1,11 +1,28 @@
 import { contentFor } from '../content'
-import type { Structure } from '../types'
+import type { Manifest, Structure } from '../types'
 
-export function InfoPanel({ structure }: { structure: Structure | null }) {
+export function InfoPanel({ structure, manifest }: { structure: Structure | null; manifest: Manifest }) {
   if (!structure) {
     return (
       <section className="info empty">
-        <p>Click a structure in the 3D model, the CT slices, or the list to learn about it.</p>
+        <div>
+          <p>Click a structure in the 3D model, the CT slices, or the list to learn about it.</p>
+          <p className="note">
+            Scan:{' '}
+            {manifest.sourceUrl ? (
+              <a href={manifest.sourceUrl} target="_blank" rel="noreferrer">
+                {manifest.source}
+              </a>
+            ) : (
+              manifest.source
+            )}
+          </p>
+          {manifest.noData.map((gap) => (
+            <p key={gap.zRange.join()} className="note">
+              {gap.note}.
+            </p>
+          ))}
+        </div>
       </section>
     )
   }
